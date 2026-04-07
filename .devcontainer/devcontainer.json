@@ -1,12 +1,7 @@
 {
   "name": "agent-claudia",
   "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
-  "features": {
-    "ghcr.io/devcontainers/features/postgres:1": {
-      "version": "16"
-    }
-  },
-  "onCreateCommand": "pip install uv && uv sync",
+  "onCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql-16 && pip install uv && uv sync",
   "forwardPorts": [8000, 5432],
   "portsAttributes": {
     "8000": {
