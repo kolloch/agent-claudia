@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """PostgreSQL configuration benchmark.
 
-Starts a fresh PostgreSQL instance for each configuration variant,
-fills it with sample data, stops it, cleans up, and measures the time
-for each phase.  Repeats the cycle several times and prints statistics.
+For each configuration variant the benchmark:
+  1. Runs ``initdb`` once to create a template data directory (one-time setup).
+  2. Per iteration: copies the template directory, starts postgres, runs the
+     workload, stops postgres, and removes the copy.
+
+This separates the immutable initialisation cost from the repeatable
+start/stop signal so that ``start`` and ``stop`` are the primary metrics.
 
 Usage:
     uv run postgres_bench/benchmark.py
@@ -88,14 +92,14 @@ def load_configs() -> dict[str, str]:
 class IterationResult:
     config_name: str
     iteration: int
-    init_s: float
+    copy_s: float   # time to copy the template data directory
     start_s: float
     load_s: float
     stop_s: float
 
     @property
     def total_s(self) -> float:
-        return self.init_s + self.start_s + self.load_s + self.stop_s
+        return self.copy_s + self.start_s + self.load_s + self.stop_s
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,44 @@ async def _load_sample_data(dsn: str, num_rows: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# One-time template setup
+# ---------------------------------------------------------------------------
+
+
+def setup_template(
+    config_name: str,
+    config_text: str,
+    pg_bin: Path,
+    root: Path,
+) -> tuple[Path, float]:
+    """Run ``initdb`` once and write the variant config.
+
+    Returns the template directory path and the time taken (seconds).
+    Port and socket path are deliberately omitted from the stored config —
+    those runtime settings are injected fresh on every iteration copy.
+    """
+    template_dir = root / f"template_{config_name}"
+
+    t0 = time.perf_counter()
+    subprocess.run(
+        [
+            str(pg_bin / "initdb"),
+            "-D", str(template_dir),
+            "--auth=trust",
+            "--no-instructions",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    # Overwrite postgresql.conf with the variant settings only.
+    # Runtime settings (port, socket, logging) are added per-iteration.
+    (template_dir / "postgresql.conf").write_text(config_text)
+    init_s = time.perf_counter() - t0
+
+    return template_dir, init_s
+
+
+# ---------------------------------------------------------------------------
 # Single benchmark cycle
 # ---------------------------------------------------------------------------
 
@@ -138,33 +180,24 @@ async def _load_sample_data(dsn: str, num_rows: int) -> None:
 def run_one_cycle(
     config_name: str,
     config_text: str,
+    template_dir: Path,
     iteration: int,
     pg_bin: Path,
     num_rows: int,
 ) -> IterationResult:
-    """Run one full init → start → load → stop → cleanup cycle."""
+    """Copy template → start → load → stop → cleanup."""
 
     tmpdir = Path(tempfile.mkdtemp(prefix="pgbench_"))
-    data_dir = tmpdir / "data"
 
     try:
-        # ── initdb ──────────────────────────────────────────────────────────
+        # ── copy template data directory ─────────────────────────────────────
+        data_dir = tmpdir / "data"
         t0 = time.perf_counter()
-        subprocess.run(
-            [
-                str(pg_bin / "initdb"),
-                "-D", str(data_dir),
-                "--auth=trust",
-                "--no-instructions",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        init_s = time.perf_counter() - t0
+        shutil.copytree(template_dir, data_dir)
+        copy_s = time.perf_counter() - t0
 
-        # ── write postgresql.conf ────────────────────────────────────────────
-        # Append variant settings on top of the initdb-generated conf.
-        # Settings listed later take precedence in postgresql.conf.
+        # ── write runtime postgresql.conf overrides ──────────────────────────
+        # Appended after the variant settings so they always win.
         port = find_free_port()
         socket_dir = tmpdir / "run"
         socket_dir.mkdir()
@@ -221,7 +254,7 @@ def run_one_cycle(
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    return IterationResult(config_name, iteration, init_s, start_s, load_s, stop_s)
+    return IterationResult(config_name, iteration, copy_s, start_s, load_s, stop_s)
 
 
 # ---------------------------------------------------------------------------
@@ -239,22 +272,42 @@ def run_benchmark(iterations: int, num_rows: int) -> list[IterationResult]:
     print(f"Variants            : {', '.join(configs)}")
     print()
 
+    root = Path(tempfile.mkdtemp(prefix="pgbench_root_"))
     results: list[IterationResult] = []
-    for i in range(1, iterations + 1):
-        print(f"── Iteration {i}/{iterations} " + "─" * 40)
+
+    try:
+        # ── one-time setup: initdb per variant ───────────────────────────────
+        print("── Setup: initialising template data directories ────────────────")
+        templates: dict[str, tuple[Path, float]] = {}
         for config_name, config_text in configs.items():
             print(f"  {config_name:<25}", end="", flush=True)
-            try:
-                r = run_one_cycle(config_name, config_text, i, pg_bin, num_rows)
-                results.append(r)
-                print(
-                    f"  init={r.init_s:.2f}s  start={r.start_s:.2f}s"
-                    f"  load={r.load_s:.2f}s  stop={r.stop_s:.2f}s"
-                    f"  → total={r.total_s:.2f}s"
-                )
-            except Exception as exc:
-                print(f"  ERROR: {exc}")
+            template_dir, init_s = setup_template(config_name, config_text, pg_bin, root)
+            templates[config_name] = (template_dir, init_s)
+            print(f"  init={init_s:.2f}s")
         print()
+
+        # ── repeated iterations ───────────────────────────────────────────────
+        for i in range(1, iterations + 1):
+            print(f"── Iteration {i}/{iterations} " + "─" * 40)
+            for config_name, config_text in configs.items():
+                template_dir, _ = templates[config_name]
+                print(f"  {config_name:<25}", end="", flush=True)
+                try:
+                    r = run_one_cycle(
+                        config_name, config_text, template_dir, i, pg_bin, num_rows
+                    )
+                    results.append(r)
+                    print(
+                        f"  copy={r.copy_s:.2f}s  start={r.start_s:.2f}s"
+                        f"  load={r.load_s:.2f}s  stop={r.stop_s:.2f}s"
+                        f"  → total={r.total_s:.2f}s"
+                    )
+                except Exception as exc:
+                    print(f"  ERROR: {exc}")
+            print()
+
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
     return results
 
@@ -263,8 +316,8 @@ def run_benchmark(iterations: int, num_rows: int) -> list[IterationResult]:
 # Statistics & reporting
 # ---------------------------------------------------------------------------
 
-_PHASES = ("init_s", "start_s", "load_s", "stop_s", "total_s")
-_PHASE_LABELS = ("init", "start", "load", "stop", "total")
+_PHASES = ("copy_s", "start_s", "load_s", "stop_s", "total_s")
+_PHASE_LABELS = ("copy", "start", "load", "stop", "total")
 
 
 def _stats(values: list[float]) -> tuple[float, float, float, float, float]:
