@@ -1,5 +1,7 @@
 # agent-claudia
 
+(A YOLO trial repository, don't take it seriously)
+
 A minimal Python web service built with [FastAPI](https://fastapi.tiangolo.com/) and PostgreSQL, managed by [uv](https://docs.astral.sh/uv/).
 
 ## Prerequisites
